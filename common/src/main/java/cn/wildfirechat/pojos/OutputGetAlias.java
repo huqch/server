@@ -9,15 +9,17 @@
 package cn.wildfirechat.pojos;
 
 
-import cn.wildfirechat.proto.WFCMessage;
-
-public class OutputCreateChannel {
+public class OutputGetAlias {
+    private String operator;
     private String targetId;
-    private String secret;
+    private String alias;
 
-    public OutputCreateChannel(String targetId, String secret) {
+    public OutputGetAlias() {
+    }
+
+    public OutputGetAlias(String operator, String targetId) {
+        this.operator = operator;
         this.targetId = targetId;
-        this.secret = secret;
     }
 
     public String getTargetId() {
@@ -28,11 +30,19 @@ public class OutputCreateChannel {
         this.targetId = targetId;
     }
 
-    public String getSecret() {
-        return secret;
+    public String getOperator() {
+        return operator;
     }
 
-    public void setSecret(String secret) {
-        this.secret = secret;
+    public void setOperator(String operator) {
+        this.operator = operator;
+    }
+
+    public String getAlias() {
+        return alias;
+    }
+
+    public void setAlias(String alias) {
+        this.alias = alias;
     }
 }

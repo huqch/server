@@ -25,6 +25,7 @@ import com.hazelcast.util.StringUtil;
 import com.xiaoleilu.loServer.model.FriendData;
 import cn.wildfirechat.pojos.InputOutputUserBlockStatus;
 import cn.wildfirechat.common.ErrorCode;
+import io.moquette.BrokerConstants;
 import io.moquette.server.Constants;
 import io.moquette.server.Server;
 import io.moquette.spi.IMatchingCondition;
@@ -42,7 +43,6 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.*;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Lock;
@@ -112,12 +112,21 @@ public class MemoryMessagesStore implements IMessagesStore {
     private final DatabaseStore databaseStore;
     private ConcurrentHashMap<String, Long> userMaxPullSeq = new ConcurrentHashMap<>();
 
-    private AtomicReference<SensitiveFilter> mSensitiveFilter = new AtomicReference<>();
+    private SensitiveFilter mSensitiveFilter;
     private volatile long lastUpdateSensitiveTime = 0;
 
     private ConcurrentHashMap<String, Boolean> userGlobalSlientMap = new ConcurrentHashMap<>();
     private ConcurrentHashMap<String, Boolean> userPushHiddenDetail = new ConcurrentHashMap<>();
     private ConcurrentHashMap<String, Boolean> userConvSlientMap = new ConcurrentHashMap<>();
+
+    private long mFriendRequestDuration = 7 * 24 * 60 * 60 * 1000;
+    private long mFriendRejectDuration = 30 * 24 * 60 * 60 * 1000;
+    private long mFriendRequestExpiration = 7 * 24 * 60 * 60 * 1000;
+
+    private boolean mDisableStrangerChat = false;
+
+    private long mChatroomParticipantIdleTime = 900000;
+    private boolean mChatroomRejoinWhenActive = true;
 
     MemoryMessagesStore(Server server, DatabaseStore databaseStore) {
         m_Server = server;
@@ -125,6 +134,48 @@ public class MemoryMessagesStore implements IMessagesStore {
         IS_MESSAGE_ROAMING = "1".equals(m_Server.getConfig().getProperty(MESSAGE_ROAMING));
         IS_MESSAGE_REMOTE_HISTORY_MESSAGE = "1".equals(m_Server.getConfig().getProperty(MESSAGE_Remote_History_Message));
         Constants.MAX_MESSAGE_QUEUE = Integer.parseInt(m_Server.getConfig().getProperty(MESSAGE_Max_Queue));
+
+        try {
+            mDisableStrangerChat = Boolean.parseBoolean(m_Server.getConfig().getProperty(BrokerConstants.MESSAGE_Disable_Stranger_Chat));
+        } catch (Exception e) {
+            e.printStackTrace();
+            Utility.printExecption(LOG, e);
+        }
+
+        try {
+            mFriendRequestDuration = Long.parseLong(m_Server.getConfig().getProperty(FRIEND_Repeat_Request_Duration));
+        } catch (Exception e) {
+            e.printStackTrace();
+            Utility.printExecption(LOG, e);
+        }
+
+        try {
+            mFriendRejectDuration = Long.parseLong(m_Server.getConfig().getProperty(FRIEND_Reject_Request_Duration));
+        } catch (Exception e) {
+            e.printStackTrace();
+            Utility.printExecption(LOG, e);
+        }
+
+        try {
+            mFriendRequestExpiration = Long.parseLong(m_Server.getConfig().getProperty(FRIEND_Request_Expiration_Duration));
+        } catch (Exception e) {
+            e.printStackTrace();
+            Utility.printExecption(LOG, e);
+        }
+
+        try {
+            mChatroomRejoinWhenActive = Boolean.parseBoolean(m_Server.getConfig().getProperty(BrokerConstants.CHATROOM_Rejoin_When_Active));
+        } catch (Exception e) {
+            e.printStackTrace();
+            Utility.printExecption(LOG, e);
+        }
+
+        try {
+            mChatroomParticipantIdleTime = Long.parseLong(m_Server.getConfig().getProperty(CHATROOM_Participant_Idle_Time, "900000"));
+        } catch (Exception e) {
+            e.printStackTrace();
+            Utility.printExecption(LOG, e);
+        }
     }
 
     @Override
@@ -148,7 +199,7 @@ public class MemoryMessagesStore implements IMessagesStore {
                 }
             }
             Set<String> sensitiveWords = databaseStore.getSensitiveWord();
-            mSensitiveFilter.set(new SensitiveFilter(sensitiveWords));
+            mSensitiveFilter = new SensitiveFilter(sensitiveWords);
         }
     }
 
@@ -180,12 +231,24 @@ public class MemoryMessagesStore implements IMessagesStore {
 
 
     @Override
-    public int getNotifyReceivers(String fromUser, WFCMessage.Message.Builder messageBuilder, Set<String> notifyReceivers) {
+    public int getNotifyReceivers(String fromUser, WFCMessage.Message.Builder messageBuilder, Set<String> notifyReceivers, boolean ignoreMsg) {
         WFCMessage.Message message = messageBuilder.build();
         HazelcastInstance hzInstance = m_Server.getHazelcastInstance();
         int type = message.getConversation().getType();
+        int pullType = ProtoConstants.PullType.Pull_Normal;
 
-        int pullType = 0;
+        if (ignoreMsg) {
+            if (type == ProtoConstants.ConversationType.ConversationType_ChatRoom) {
+                pullType = ProtoConstants.PullType.Pull_ChatRoom;
+            }
+
+            if (message.getContent().getPersistFlag() != Transparent) {
+                notifyReceivers.add(fromUser);
+            }
+            return pullType;
+        }
+
+
         if (type == ProtoConstants.ConversationType.ConversationType_Private) {
             notifyReceivers.add(fromUser);
             notifyReceivers.add(message.getConversation().getTarget());
@@ -351,8 +414,17 @@ public class MemoryMessagesStore implements IMessagesStore {
                             continue;
                         }
 
+                        if (bundle.getMessage().getContent().getExpireDuration() > 0) {
+                            if (System.currentTimeMillis() < bundle.getMessage().getServerTimestamp() + bundle.getMessage().getContent().getExpireDuration()) {
+                                continue;
+                            }
+                        }
+
                         size += bundle.getMessage().getSerializedSize();
                         if (size >= 512 * 1024) { //3M
+                            if(builder.getMessageCount() == 0){
+                                builder.addMessage(bundle.getMessage());
+                            }
                             break;
                         }
                         builder.addMessage(bundle.getMessage());
@@ -531,13 +603,29 @@ public class MemoryMessagesStore implements IMessagesStore {
     @Override
     public boolean checkUserClientInChatroom(String user, String clientId, String chatroomId) {
         MemorySessionStore.Session session = m_Server.getStore().sessionsStore().getSession(clientId);
-        if (session == null || System.currentTimeMillis() - session.getLastChatroomActiveTime() > 5 * 60 * 1000) {
-            handleQuitChatroom(user, clientId, chatroomId);
-            return false;
-        }
 
         String existChatroomId = (String)m_Server.getHazelcastInstance().getMap(USER_CHATROOM).get(user);
-        if (StringUtil.isNullOrEmpty(existChatroomId) && (chatroomId == null || !existChatroomId.equals(chatroomId))) {
+        if (chatroomId == null) {
+            if (existChatroomId == null) {
+                return false;
+            } else {
+                chatroomId = existChatroomId;
+            }
+        }
+
+        if (StringUtil.isNullOrEmpty(existChatroomId) || !existChatroomId.equals(chatroomId)) {
+            if (mChatroomRejoinWhenActive) {
+                if (!StringUtil.isNullOrEmpty(existChatroomId)) {
+                    handleQuitChatroom(user, clientId, existChatroomId);
+                }
+                handleJoinChatroom(user, clientId, chatroomId);
+            } else {
+                return false;
+            }
+        }
+
+        if (!mChatroomRejoinWhenActive && !checkChatroomParticipantIdelTime(session)) {
+            handleQuitChatroom(user, clientId, chatroomId);
             return false;
         }
 
@@ -1192,8 +1280,9 @@ public class MemoryMessagesStore implements IMessagesStore {
         if (members == null || members.size() == 0) {
             members = loadGroupMemberFromDB(hzInstance, groupId);
         }
-        for (WFCMessage.GroupMember member : members
-            ) {
+        
+        boolean isInGroup = false;
+        for (WFCMessage.GroupMember member : members) {
             if (member.getMemberId().equals(memberId)) {
                 if (member.getType() == GroupMemberType_Silent) {
                     return ErrorCode.ERROR_CODE_NOT_RIGHT;
@@ -1206,9 +1295,14 @@ public class MemoryMessagesStore implements IMessagesStore {
                 if (member.getMemberId().equals(memberId) && member.getType() == GroupMemberType_Removed) {
                     return ErrorCode.ERROR_CODE_NOT_IN_GROUP;
                 }
+                isInGroup = true;
                 break;
             }
 
+        }
+
+        if (!isInGroup) {
+            return ErrorCode.ERROR_CODE_NOT_IN_GROUP;
         }
 
         return ErrorCode.ERROR_CODE_SUCCESS;
@@ -1344,7 +1438,7 @@ public class MemoryMessagesStore implements IMessagesStore {
     }
 
     @Override
-    public ErrorCode modifyUserInfo(String userId, WFCMessage.ModifyMyInfoRequest request) {
+    public ErrorCode modifyUserInfo(String userId, WFCMessage.ModifyMyInfoRequest request) throws Exception {
         HazelcastInstance hzInstance = m_Server.getHazelcastInstance();
         IMap<String, WFCMessage.User> mUserMap = hzInstance.getMap(USERS);
 
@@ -1407,8 +1501,8 @@ public class MemoryMessagesStore implements IMessagesStore {
         if (modified) {
             builder.setUpdateDt(System.currentTimeMillis());
             user = builder.build();
+            databaseStore.updateUser(user);
             mUserMap.set(userId, user);
-//            databaseStore.updateUser(user);
             return ErrorCode.ERROR_CODE_SUCCESS;
         } else {
             return ErrorCode.ERROR_CODE_NOT_MODIFIED;
@@ -1453,9 +1547,10 @@ public class MemoryMessagesStore implements IMessagesStore {
     }
 
     @Override
-    public void addUserInfo(WFCMessage.User user, String password) {
+    public void addUserInfo(WFCMessage.User user, String password) throws Exception {
         HazelcastInstance hzInstance = m_Server.getHazelcastInstance();
         IMap<String, WFCMessage.User> mUserMap = hzInstance.getMap(USERS);
+        databaseStore.updateUser(user);
         mUserMap.put(user.getUid(), user);
         databaseStore.updateUserPassword(user.getUid(), password);
     }
@@ -1466,7 +1561,13 @@ public class MemoryMessagesStore implements IMessagesStore {
         IMap<String, WFCMessage.User> mUserMap = hzInstance.getMap(USERS);
         WFCMessage.User us = mUserMap.get(userId);
         if (us != null) {
-            us = WFCMessage.User.newBuilder().setUid(userId).setUpdateDt(System.currentTimeMillis()).setDisplayName("已删除用户").setName(userId).setDeleted(1).build();
+            us = WFCMessage.User.newBuilder().setUid(userId).setUpdateDt(System.currentTimeMillis()).setDisplayName("").setName(userId).setDeleted(1).build();
+            try {
+                databaseStore.updateUser(us);
+            } catch (Exception e) {
+                e.printStackTrace();
+                Utility.printExecption(LOG, e);
+            }
             mUserMap.put(userId, us);
         }
 
@@ -1622,27 +1723,49 @@ public class MemoryMessagesStore implements IMessagesStore {
     }
 
     @Override
-    public boolean isBlacked(String fromUser, String userId) {
+    public ErrorCode isAllowUserMessage(String targetUser, String fromUser) {
         HazelcastInstance hzInstance = m_Server.getHazelcastInstance();
         MultiMap<String, FriendData> friendsMap = hzInstance.getMultiMap(USER_FRIENDS);
 
-        Collection<FriendData> friendDatas = friendsMap.get(fromUser);
+        Collection<FriendData> friendDatas = friendsMap.get(targetUser);
 
         if (friendDatas == null || friendDatas.size() == 0) {
-            friendDatas = loadFriend(friendsMap, fromUser);
+            friendDatas = loadFriend(friendsMap, targetUser);
         }
 
         for (FriendData friendData : friendDatas) {
-            if (friendData.getFriendUid().equals(userId)) {
+            if (friendData.getFriendUid().equals(fromUser)) {
                 if (friendData.getBlacked() == 1) {
-                    return true;
+                    return ErrorCode.ERROR_CODE_IN_BLACK_LIST;
                 } else {
-                    return false;
+                    if (friendData.getState() == 0) {
+                        return ErrorCode.ERROR_CODE_SUCCESS;
+                    } else {
+                        break;
+                    }
                 }
             }
         }
 
-        return false;
+        if (mDisableStrangerChat) {
+            //在禁止私聊时，允许机器人，物联网设备及管理员进行私聊。
+            IMap<String, WFCMessage.User> mUserMap = hzInstance.getMap(USERS);
+            WFCMessage.User target = mUserMap.get(targetUser);
+            if (target != null && target.getType() != ProtoConstants.UserType.UserType_Normal) {
+                return ErrorCode.ERROR_CODE_SUCCESS;
+            }
+            target = mUserMap.get(fromUser);
+            if (target != null && target.getType() != ProtoConstants.UserType.UserType_Normal) {
+                return ErrorCode.ERROR_CODE_SUCCESS;
+            }
+            //admin的usertype为3，所以不需要hardcode为admin添加例外
+//            if (targetUser.equals("admin") || fromUser.equals("admin")) {
+//                return ErrorCode.ERROR_CODE_SUCCESS;
+//            }
+            return ErrorCode.ERROR_CODE_NOT_RIGHT;
+        }
+
+        return ErrorCode.ERROR_CODE_SUCCESS;
     }
 
     @Override
@@ -1825,9 +1948,9 @@ public class MemoryMessagesStore implements IMessagesStore {
         }
 
         if (existRequest != null && existRequest.getStatus() != ProtoConstants.FriendRequestStatus.RequestStatus_Accepted) {
-            if (System.currentTimeMillis() - existRequest.getUpdateDt() > 7 * 24 * 60 * 60 * 1000) {
+            if (mFriendRequestDuration > 0 && System.currentTimeMillis() - existRequest.getUpdateDt() > mFriendRequestDuration) {
                 if (existRequest.getStatus() == ProtoConstants.FriendRequestStatus.RequestStatus_Rejected
-                    && System.currentTimeMillis() - existRequest.getUpdateDt() < 30 * 24 * 60 * 60 * 1000) {
+                    && System.currentTimeMillis() - existRequest.getUpdateDt() < mFriendRejectDuration) {
                     return ErrorCode.ERROR_CODE_FRIEND_REQUEST_BLOCKED;
                 }
             } else {
@@ -1959,8 +2082,8 @@ public class MemoryMessagesStore implements IMessagesStore {
         }
 
         if (existRequest != null) {
-            if (System.currentTimeMillis() - existRequest.getUpdateDt() > 7 * 24 * 60 * 60 * 1000) {
-                return ErrorCode.ERROR_CODE_FRIEND_REQUEST_OVERTIME;
+            if (mFriendRequestExpiration > 0 && System.currentTimeMillis() - existRequest.getUpdateDt() > mFriendRequestExpiration) {
+                return ErrorCode.ERROR_CODE_FRIEND_REQUEST_EXPIRED;
             } else {
                 existRequest = existRequest.toBuilder().setStatus(ProtoConstants.FriendRequestStatus.RequestStatus_Accepted).setUpdateDt(System.currentTimeMillis()).build();
                 databaseStore.persistOrUpdateFriendRequest(existRequest);
@@ -1996,7 +2119,7 @@ public class MemoryMessagesStore implements IMessagesStore {
         } else {
             state = 0;
         }
-        
+
         HazelcastInstance hzInstance = m_Server.getHazelcastInstance();
         MultiMap<String, FriendData> friendsMap = hzInstance.getMultiMap(USER_FRIENDS);
 
@@ -2093,6 +2216,18 @@ public class MemoryMessagesStore implements IMessagesStore {
     }
 
     @Override
+    public boolean checkChatroomParticipantIdelTime(MemorySessionStore.Session session) {
+        if (session == null) {
+            return false;
+        }
+
+        if(mChatroomParticipantIdleTime > 0 && System.currentTimeMillis() - session.getLastChatroomActiveTime() > mChatroomParticipantIdleTime) {
+            return false;
+        }
+        return true;
+    }
+
+    @Override
     public ErrorCode deleteFriend(String userId, String friendUid, long[] head) {
         HazelcastInstance hzInstance = m_Server.getHazelcastInstance();
         MultiMap<String, FriendData> friendsMap = hzInstance.getMultiMap(USER_FRIENDS);
@@ -2183,6 +2318,7 @@ public class MemoryMessagesStore implements IMessagesStore {
                                 }
                             } catch (Exception e) {
                                 e.printStackTrace();
+                                Utility.printExecption(LOG, e);
                             }
 
                         }
@@ -2391,8 +2527,9 @@ public class MemoryMessagesStore implements IMessagesStore {
         else if(modifyType == Modify_Channel_OnlyCallback) {
             try {
                 newInfoBuilder.setAutomatic(Integer.parseInt(value));
-            } catch (NumberFormatException e) {
+            } catch (Exception e) {
                 e.printStackTrace();
+                Utility.printExecption(LOG, e);
             }
         }
 
@@ -2499,7 +2636,7 @@ public class MemoryMessagesStore implements IMessagesStore {
     @Override
     public Set<String> handleSensitiveWord(String message) {
         updateSensitiveWord();
-        return mSensitiveFilter.get().getSensitiveWords(message, SensitiveFilter.MatchType.MAX_MATCH);
+        return mSensitiveFilter.getSensitiveWords(message, SensitiveFilter.MatchType.MAX_MATCH);
     }
 
     @Override
@@ -2642,7 +2779,7 @@ public class MemoryMessagesStore implements IMessagesStore {
         }
         return UUIDGenerator.getUUID();
     }
-    
+
     @Override
     public void storeRetained(Topic topic, StoredMessage storedMessage) {
         LOG.debug("Store retained message for topic={}, CId={}", topic, storedMessage.getClientID());

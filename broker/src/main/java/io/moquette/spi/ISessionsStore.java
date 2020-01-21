@@ -38,7 +38,7 @@ public interface ISessionsStore {
      */
     boolean contains(String clientID);
 
-    Session createUserSession(String username, String clientID, int platform);
+    Session updateOrCreateUserSession(String username, String clientID, int platform);
 
     ErrorCode loadActiveSession(String username, String clientID);
 
@@ -46,7 +46,7 @@ public interface ISessionsStore {
 
     Session getSession(String clientID);
 
-    void cleanDuplatedToken(String cid, int pushType, String token, boolean isVoip);
+    void cleanDuplatedToken(String cid, int pushType, String token, boolean isVoip, String packageName);
 
     void updateSessionToken(Session session, boolean voip);
 

@@ -29,6 +29,7 @@ import io.moquette.spi.IMessagesStore.StoredMessage;
 import io.netty.handler.codec.mqtt.MqttVersion;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import win.liyufan.im.Utility;
 
 import java.util.*;
 import java.util.concurrent.*;
@@ -272,6 +273,7 @@ public class MemorySessionStore implements ISessionsStore {
             supportMultiEndpoint = Boolean.parseBoolean(server.getConfig().getProperty(BrokerConstants.SERVER_MULTI_ENDPOINT));
         } catch (Exception e) {
             e.printStackTrace();
+            Utility.printExecption(LOG, e);
         }
     }
 
@@ -285,7 +287,7 @@ public class MemorySessionStore implements ISessionsStore {
     }
 
     @Override
-    public void cleanDuplatedToken(String cid, int pushType, String token, boolean isVoip) {
+    public void cleanDuplatedToken(String cid, int pushType, String token, boolean isVoip, String packageName) {
         if (StringUtil.isNullOrEmpty(token) || isVoip) {
             return;
         }
@@ -293,7 +295,7 @@ public class MemorySessionStore implements ISessionsStore {
         Iterator<Map.Entry<String, Session>> it = sessions.entrySet().iterator();
         while (it.hasNext()) {
             Session session = it.next().getValue();
-            if (!session.getClientID().equals(cid) && (session.pushType == pushType && token.equals(session.deviceToken))) {
+            if (!session.getClientID().equals(cid) && (session.pushType == pushType && token.equals(session.deviceToken)) && (!StringUtil.isNullOrEmpty(packageName) && packageName.equals(session.getAppName()))) {
                 session.deviceToken = null;
             }
         }
@@ -328,15 +330,24 @@ public class MemorySessionStore implements ISessionsStore {
     }
 
     @Override
-    public Session createUserSession(String username, String clientID, int platform) {
+    public Session updateOrCreateUserSession(String username, String clientID, int platform) {
         LOG.debug("createUserSession for client <{}>, user <{}>", clientID, username);
 
+        Session session = sessions.get(clientID);
+
+        if (session != null && !session.username.equals(username)) {
+            if (userSessions.get(username) != null) {
+                userSessions.get(username).remove(clientID);
+            }
+        }
         ClientSession clientSession = new ClientSession(clientID, this);
-        Session session = databaseStore.getSession(username, clientID, clientSession);
+        session = databaseStore.getSession(username, clientID, clientSession);
 
         if (session == null) {
             session = databaseStore.createSession(username, clientID, clientSession, platform);
         }
+        sessions.put(clientID, session);
+
 
         if (session.getDeleted() > 0) {
             session.setDeleted(0);

@@ -21,6 +21,7 @@ import cn.wildfirechat.proto.WFCMessage;
 import com.xiaoleilu.loServer.model.FriendData;
 import cn.wildfirechat.pojos.InputOutputUserBlockStatus;
 import io.moquette.persistence.DatabaseStore;
+import io.moquette.persistence.MemorySessionStore;
 import io.moquette.persistence.UserClientEntry;
 import io.moquette.spi.impl.subscriptions.Topic;
 import io.netty.buffer.ByteBuf;
@@ -98,7 +99,7 @@ public interface IMessagesStore {
     DatabaseStore getDatabaseStore();
     WFCMessage.Message storeMessage(String fromUser, String fromClientId, WFCMessage.Message message);
     void storeSensitiveMessage(WFCMessage.Message message);
-	int getNotifyReceivers(String fromUser, WFCMessage.Message.Builder message, Set<String> notifyReceivers);
+	int getNotifyReceivers(String fromUser, WFCMessage.Message.Builder message, Set<String> notifyReceivers, boolean ignoreMsg);
     Set<String> getAllEnds();
     WFCMessage.PullMessageResult fetchMessage(String user, String exceptClientId, long fromMessageId, int pullType);
     WFCMessage.PullMessageResult loadRemoteMessages(String user, WFCMessage.Conversation conversation, long beforeUid, int count);
@@ -128,13 +129,13 @@ public interface IMessagesStore {
     WFCMessage.Robot getRobot(String robotId);
     void addRobot(WFCMessage.Robot robot);
     ErrorCode getUserInfo(List<WFCMessage.UserRequest> requestList, WFCMessage.PullUserResult.Builder builder);
-    ErrorCode modifyUserInfo(String userId, WFCMessage.ModifyMyInfoRequest request);
+    ErrorCode modifyUserInfo(String userId, WFCMessage.ModifyMyInfoRequest request) throws Exception;
 
     ErrorCode modifyUserStatus(String userId, int status);
     int getUserStatus(String userId);
     List<InputOutputUserBlockStatus> getUserStatusList();
 
-    void addUserInfo(WFCMessage.User user, String password);
+    void addUserInfo(WFCMessage.User user, String password) throws Exception;
     void destoryUser(String userId);
     WFCMessage.User getUserInfo(String userId);
     WFCMessage.User getUserInfoByName(String name);
@@ -167,11 +168,13 @@ public interface IMessagesStore {
     ErrorCode deleteFriend(String userId, String friendUid, long[] head);
     ErrorCode blackUserRequest(String fromUser, String targetUserId, int status, long[] head);
     ErrorCode SyncFriendRequestUnread(String userId, long unreadDt, long[] head);
-    boolean isBlacked(String fromUser, String userId);
+    ErrorCode isAllowUserMessage(String fromUser, String userId);
     ErrorCode setFriendAliasRequest(String fromUser, String targetUserId, String alias, long[] head);
 
     ErrorCode handleJoinChatroom(String userId, String clientId, String chatroomId);
     ErrorCode handleQuitChatroom(String userId, String clientId, String chatroomId);
+
+    boolean checkChatroomParticipantIdelTime(MemorySessionStore.Session session);
 
     ErrorCode getUserSettings(String userId, long version, WFCMessage.GetUserSettingResult.Builder builder);
     WFCMessage.UserSettingEntry getUserSetting(String userId, int scope, String key);

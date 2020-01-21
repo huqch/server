@@ -125,6 +125,8 @@ public class ProtoConstants {
         int UserType_Normal = 0;
         int UserType_Robot = 1;
         int UserType_Device = 2;
+        int UserType_Admin = 3;
+        int UserType_Super_Admin = 100;
     }
 
 
@@ -137,6 +139,17 @@ public class ProtoConstants {
         int SearchUserType_Name_Mobile = 1;
         int SearchUserType_Name = 2;
         int SearchUserType_Mobile = 3;
+    }
+
+    public interface UserStatus {
+        int Normal = 0;
+        int Muted = 1;
+        int Forbidden = 2;
+    }
+
+    public interface BlacklistStrategy {
+        int Message_Reject = 0;
+        int Message_Ignore = 1;
     }
 
 
