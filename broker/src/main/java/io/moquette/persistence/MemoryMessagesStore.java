@@ -50,8 +50,7 @@ import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Consumer;
 
-
-import static cn.wildfirechat.proto.ProtoConstants.ChannelStatus.Channel_Status_Destoryed;
+import static cn.wildfirechat.proto.ProtoConstants.ChannelState.Channel_State_Mask_Deleted;
 import static cn.wildfirechat.proto.ProtoConstants.GroupMemberType.*;
 import static cn.wildfirechat.proto.ProtoConstants.ModifyChannelInfoType.*;
 import static cn.wildfirechat.proto.ProtoConstants.ModifyGroupInfoType.*;
@@ -1294,7 +1293,7 @@ public class MemoryMessagesStore implements IMessagesStore {
         if (members == null || members.size() == 0) {
             members = loadGroupMemberFromDB(hzInstance, groupId);
         }
-        
+
         boolean isInGroup = false;
         for (WFCMessage.GroupMember member : members) {
             if (member.getMemberId().equals(memberId)) {
@@ -2099,26 +2098,27 @@ public class MemoryMessagesStore implements IMessagesStore {
             if (mFriendRequestExpiration > 0 && System.currentTimeMillis() - existRequest.getUpdateDt() > mFriendRequestExpiration) {
                 return ErrorCode.ERROR_CODE_FRIEND_REQUEST_EXPIRED;
             } else {
-                existRequest = existRequest.toBuilder().setStatus(ProtoConstants.FriendRequestStatus.RequestStatus_Accepted).setUpdateDt(System.currentTimeMillis()).build();
+                existRequest = existRequest.toBuilder().setStatus(request.getStatus()).setUpdateDt(System.currentTimeMillis()).build();
                 databaseStore.persistOrUpdateFriendRequest(existRequest);
-                MultiMap<String, FriendData> friendsMap = hzInstance.getMultiMap(USER_FRIENDS);
+                if(request.getStatus() == ProtoConstants.FriendRequestStatus.RequestStatus_Accepted){
+                    MultiMap<String, FriendData> friendsMap = hzInstance.getMultiMap(USER_FRIENDS);
+                    FriendData friendData1 = new FriendData(userId, request.getTargetUid(), "", 0, 0, System.currentTimeMillis());
+                    databaseStore.persistOrUpdateFriendData(friendData1);
 
-                FriendData friendData1 = new FriendData(userId, request.getTargetUid(), "", 0, 0, System.currentTimeMillis());
-                databaseStore.persistOrUpdateFriendData(friendData1);
+                    FriendData friendData2 = new FriendData(request.getTargetUid(), userId, "", 0, 0, friendData1.getTimestamp());
+                    databaseStore.persistOrUpdateFriendData(friendData2);
 
-                FriendData friendData2 = new FriendData(request.getTargetUid(), userId, "", 0, 0, friendData1.getTimestamp());
-                databaseStore.persistOrUpdateFriendData(friendData2);
+                    requestMap.remove(userId);
+                    requestMap.remove(request.getTargetUid());
+                    friendsMap.remove(userId);
+                    friendsMap.remove(request.getTargetUid());
 
-                requestMap.remove(userId);
-                requestMap.remove(request.getTargetUid());
-                friendsMap.remove(userId);
-                friendsMap.remove(request.getTargetUid());
+                    heads[0] = friendData2.getTimestamp();
+                    heads[1] = friendData1.getTimestamp();
 
-                heads[0] = friendData2.getTimestamp();
-                heads[1] = friendData1.getTimestamp();
-
-                msgBuilder.setConversation(WFCMessage.Conversation.newBuilder().setTarget(userId).setLine(0).setType(ProtoConstants.ConversationType.ConversationType_Private).build());
-                msgBuilder.setContent(WFCMessage.MessageContent.newBuilder().setType(1).setSearchableContent(existRequest.getReason()).build());
+                    msgBuilder.setConversation(WFCMessage.Conversation.newBuilder().setTarget(userId).setLine(0).setType(ProtoConstants.ConversationType.ConversationType_Private).build());
+                    msgBuilder.setContent(WFCMessage.MessageContent.newBuilder().setType(1).setSearchableContent(existRequest.getReason()).build());
+                }
                 return ErrorCode.ERROR_CODE_SUCCESS;
             }
         } else {
@@ -2616,7 +2616,7 @@ public class MemoryMessagesStore implements IMessagesStore {
 
         WFCMessage.ChannelInfo.Builder newInfoBuilder = oldInfo.toBuilder();
 
-        newInfoBuilder.setStatus(Channel_Status_Destoryed);
+        newInfoBuilder.setStatus(oldInfo.getStatus() | Channel_State_Mask_Deleted);
         newInfoBuilder.setUpdateDt(System.currentTimeMillis());
         mIMap.put(channelId, newInfoBuilder.build());
         return ErrorCode.ERROR_CODE_SUCCESS;
@@ -2679,6 +2679,16 @@ public class MemoryMessagesStore implements IMessagesStore {
             }
         }
         return true;
+    }
+
+    @Override
+    public Collection<String> getChannelSubscriber(String channelId) {
+        MultiMap<String, String> channelMembers = m_Server.getHazelcastInstance().getMultiMap(CHANNEL_LISTENERS);
+        if (channelMembers == null) {
+            return new ArrayList<>();
+        }
+
+        return channelMembers.get(channelId);
     }
 
     @Override
